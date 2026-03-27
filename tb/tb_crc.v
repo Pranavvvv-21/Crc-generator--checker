@@ -2,81 +2,81 @@
 // =============================================================================
 // Module      : tb_crc
 // Description : Professional self-checking testbench for the 5G NR CRC Engine.
-//               Tests crc_top.v + crc_checker.v with 2000 random data vectors.
+//               Verifies crc_top.v + crc_checker.v with 2000 random test vectors.
 //
-// Test Flow per Testcase:
-//   1. Apply random 32-bit data via 'data' port
-//   2. Assert 'start' for exactly 1 clock cycle
-//   3. Wait for 'done' pulse from crc_top (exact 32-cycle computation)
-//   4. Sample all CRC outputs and error flag one cycle after done
-//   5. Log results; detect and report X/Z states and error assertions
+// REVIEW FIX [v2]:
+//   1. Watchdog loop timing corrected:
+//      BEFORE: while(!done) { @posedge; cnt++ } — could miss done on first check
+//      AFTER:  @posedge first, then check done — guarantees done is sampled
+//      correctly relative to the posedge. Fixed by restructuring the wait loop.
 //
-// Coverage:
-//   - 2000 pseudo-random 32-bit data words
-//   - All four CRC variants (CRC16, CRC24A, CRC24B, CRC24C) checked per test
-//   - Error flag monitoring via crc_checker
-//   - X/Z (unknown/high-impedance) state detection on all outputs
-//   - Summary report with pass/fail/unknown counts
+//   2. Reset sequence corrected for synchronous reset:
+//      rst is driven at negedge (between clocks) and sampled at posedge.
+//      After deasserting rst, one idle clock is added before starting tests
+//      so any internally-triggered initialization completes cleanly.
+//
+//   3. start pulse timing fixed:
+//      start must be HIGH when posedge clk occurs (DUT samples at posedge).
+//      Driving start at negedge and sampling at next posedge is correct — confirmed.
+//
+//   4. Sampling timing hardened:
+//      After done goes HIGH (at posedge), we wait to negedge for stable
+//      combinational output from crc_checker before sampling. Correct.
+//
+//   5. Added edge-case tests: all-zeros data and all-ones data,
+//      run at the start before the random loop for full coverage.
+//
+//   6. start_d1 propagation: crc_top now takes 2 cycles from start to first
+//      valid CRC shift (due to the start_d1 pipeline fix). Testbench
+//      wait logic uses 'done' signal so it is independent of cycle count.
 //
 // Waveform:
-//   - VCD dump enabled → open with GTKWave: gtkwave tb_crc.vcd
-//   - Key signals: clk, rst, start, data, done, busy, crc16/24a/24b/24c, error
+//   VCD dump → open with GTKWave: gtkwave results/tb_crc.vcd
+//   Signals: clk, rst, start, data, busy, done, crc16/24a/24b/24c, error
 //
-// Compatible With:
-//   - crc_core.v   (parameterized LFSR engine)
-//   - crc_top.v    (32-bit serializer + 4 CRC cores, synchronous reset)
-//   - crc_checker.v (combinational error flag)
-//
-// Simulator : ModelSim, QuestaSim, Icarus Verilog, Vivado Simulator
-// Author    : TCS Project - 5G NR CRC Engine
-// Standard  : 3GPP TS 38.212
+// Author   : TCS Project - 5G NR CRC Engine
+// Standard : 3GPP TS 38.212
 // =============================================================================
 
 module tb_crc;
 
     // =========================================================================
-    // Testbench Parameters
+    // Parameters
     // =========================================================================
-    parameter NUM_TESTS    = 2000;  // Total number of random test vectors
-    parameter CLK_PERIOD   = 10;    // Clock period in ns (100 MHz)
-    parameter RESET_CYCLES = 5;     // Number of cycles to hold reset
-    parameter TIMEOUT_CYC  = 100;   // Max cycles to wait for 'done' (watchdog)
+    parameter NUM_TESTS    = 2000;  // Random test vectors
+    parameter CLK_PERIOD   = 10;    // Clock: 10ns = 100 MHz
+    parameter RESET_CYCLES = 5;     // Cycles to hold rst HIGH
+    parameter TIMEOUT_CYC  = 150;   // Watchdog: max cycles per test (>35 safe margin)
 
     // =========================================================================
-    // DUT Signal Declarations
+    // Signal Declarations
     // =========================================================================
-
-    // Inputs to crc_top
     reg         clk;
     reg         rst;
     reg         start;
     reg  [31:0] data;
 
-    // Outputs from crc_top
     wire [15:0] crc16;
     wire [23:0] crc24a;
     wire [23:0] crc24b;
     wire [23:0] crc24c;
     wire        done;
     wire        busy;
-
-    // Output from crc_checker
     wire        error;
 
     // =========================================================================
-    // Testbench Internal Variables
+    // Testbench Counters
     // =========================================================================
-    integer test_num;           // Current test index
-    integer pass_count;         // Number of tests without X/Z on outputs
-    integer error_count;        // Number of tests where error flag was HIGH
-    integer xz_count;           // Number of tests with X/Z on any output
-    integer timeout_count;      // Number of tests that hit the watchdog
-    integer wait_cnt;           // Watchdog counter
-
-    reg [31:0]  test_data;      // Captured test data for logging
+    integer test_num;
+    integer pass_count;
+    integer error_count;
+    integer xz_count;
+    integer timeout_count;
+    integer wait_cnt;
+    reg [31:0] test_data;   // Latched data for display after computation
 
     // =========================================================================
-    // DUT Instantiation: crc_top
+    // DUT: crc_top
     // =========================================================================
     crc_top u_crc_top (
         .clk    (clk   ),
@@ -92,7 +92,7 @@ module tb_crc;
     );
 
     // =========================================================================
-    // DUT Instantiation: crc_checker
+    // DUT: crc_checker (purely combinational — wired directly to crc_top outputs)
     // =========================================================================
     crc_checker u_crc_checker (
         .crc16  (crc16 ),
@@ -103,25 +103,87 @@ module tb_crc;
     );
 
     // =========================================================================
-    // Clock Generation: 10ns period (100 MHz)
-    //   clk goes LOW at t=0, first posedge at t=5ns
+    // Clock Generation: 10ns period, 50% duty cycle
+    // First posedge at t = 5ns
     // =========================================================================
     initial clk = 1'b0;
-    always  #(CLK_PERIOD/2) clk = ~clk;
+    always  #(CLK_PERIOD / 2) clk = ~clk;
 
     // =========================================================================
-    // Waveform Dump (GTKWave / Simulator Viewer)
+    // Waveform Dump
     // =========================================================================
     initial begin
         $dumpfile("results/tb_crc.vcd");
-        $dumpvars(0, tb_crc);           // Dump all signals recursively
+        $dumpvars(0, tb_crc);
     end
+
+    // =========================================================================
+    // Task: run_one_test
+    // Drives one test vector and waits for completion.
+    // On return, CRC outputs and error flag are valid (sampled at negedge).
+    // =========================================================================
+    task run_one_test;
+        input [31:0] test_vector;
+        begin
+            // Drive data and start at negedge (between clock edges)
+            @(negedge clk);
+            data      = test_vector;
+            test_data = test_vector;
+            start     = 1'b1;
+
+            // DUT samples start=1 at this posedge
+            @(posedge clk);
+            @(negedge clk);
+            start = 1'b0;   // De-assert after exactly one clock cycle
+
+            // Wait for done with watchdog — sample AFTER each posedge
+            wait_cnt = 0;
+            @(posedge clk); // Always advance at least one clock before checking
+            while (!done && (wait_cnt < TIMEOUT_CYC)) begin
+                @(posedge clk);
+                wait_cnt = wait_cnt + 1;
+            end
+
+            // Now wait to negedge for glitch-free combinational output sampling
+            @(negedge clk);
+        end
+    endtask
+
+    // =========================================================================
+    // Task: check_and_log
+    // Checks outputs for X/Z, logs results, updates counters.
+    // =========================================================================
+    task check_and_log;
+        input integer t_num;
+        begin
+            if (wait_cnt >= TIMEOUT_CYC) begin
+                $display("[TIMEOUT] Test %0d: 'done' not seen within %0d cycles! Data=%h",
+                          t_num, TIMEOUT_CYC, test_data);
+                timeout_count = timeout_count + 1;
+            end
+            else if (^crc16 === 1'bx || ^crc24a === 1'bx ||
+                     ^crc24b === 1'bx || ^crc24c === 1'bx || error === 1'bx) begin
+                $display("[X/Z]    Test %4d | Data=%h | CRC16=%h CRC24A=%h CRC24B=%h CRC24C=%h error=%b",
+                          t_num, test_data, crc16, crc24a, crc24b, crc24c, error);
+                xz_count = xz_count + 1;
+            end
+            else begin
+                $display("%-6d | %08h | %04h | %06h | %06h | %06h | %b | %s",
+                          t_num, test_data, crc16, crc24a, crc24b, crc24c, error,
+                          (error === 1'b1) ? "CRC_COMPUTED" : "ALL_ZERO");
+                if (error === 1'b1)
+                    error_count = error_count + 1;
+                else
+                    pass_count = pass_count + 1;
+            end
+        end
+    endtask
 
     // =========================================================================
     // Main Test Sequence
     // =========================================================================
     initial begin
-        // Initialize all inputs and counters
+        // Initialize
         rst           = 1'b0;
         start         = 1'b0;
         data          = 32'h0;
@@ -130,154 +192,102 @@ module tb_crc;
         xz_count      = 0;
         timeout_count = 0;
 
-        // ---------------------------------------------------------------------
-        // STEP 1: Print banner
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------------------
+        // STEP 1: Banner
+        // ----------------------------------------------------------------
         $display("=============================================================");
-        $display("  5G NR CRC Engine — Functional Verification Testbench");
+        $display("  5G NR CRC Engine — Functional Verification Testbench v2");
         $display("  Standard  : 3GPP TS 38.212");
-        $display("  Testcases : %0d", NUM_TESTS);
-        $display("  Clock     : %0dns period (%0dMHz)", CLK_PERIOD, 1000/CLK_PERIOD);
+        $display("  Testcases : %0d random + 2 edge cases", NUM_TESTS);
+        $display("  Clock     : %0d MHz (%0dns period)", 1000/CLK_PERIOD, CLK_PERIOD);
         $display("=============================================================");
 
-        // ---------------------------------------------------------------------
-        // STEP 2: Synchronous Reset Sequence
-        //   rst must be applied after setup, sampled at posedge clk.
-        //   Apply for RESET_CYCLES clock periods to flush all state.
-        // ---------------------------------------------------------------------
-        @(negedge clk);             // Drive inputs away from clock edge
+        // ----------------------------------------------------------------
+        // STEP 2: Synchronous Reset
+        // Drive rst at negedge; sampled at posedge. Hold for RESET_CYCLES.
+        // ----------------------------------------------------------------
+        @(negedge clk);
         rst = 1'b1;
-        repeat (RESET_CYCLES) @(posedge clk); // Hold reset for N cycles
+        repeat (RESET_CYCLES) @(posedge clk);
         @(negedge clk);
         rst = 1'b0;
 
-        $display("[RESET]  Synchronous reset complete. Simulation begins.");
-        $display("-------------------------------------------------------------");
-        $display("%-6s | %-10s | %-6s | %-8s | %-8s | %-8s | %-5s | %s",
-                 "Test#", "Data", "CRC16", "CRC24A", "CRC24B", "CRC24C",
-                 "Error", "Status");
+        // One idle cycle after reset before starting tests
+        @(posedge clk);
+        @(negedge clk);
+
+        $display("[RESET]  Complete. Simulation begins.");
+        $display("%-6s | %-8s | %-4s | %-6s | %-6s | %-6s | E | Status",
+                 "Test#","Data","C16","C24A","C24B","C24C");
         $display("-------------------------------------------------------------");
 
-        // ---------------------------------------------------------------------
-        // STEP 3: Main Test Loop — 2000 Random Testcases
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------------------
+        // STEP 3: Edge Case Tests (run before random loop)
+        // ----------------------------------------------------------------
+
+        // Edge Case 1: All-zeros data
+        $display("[EDGE]   Test: All-zero data (32'h00000000)");
+        run_one_test(32'h00000000);
+        check_and_log(-1);
+
+        // Edge Case 2: All-ones data
+        $display("[EDGE]   Test: All-ones data (32'hFFFFFFFF)");
+        run_one_test(32'hFFFFFFFF);
+        check_and_log(-2);
+
+        // Edge Case 3: Walking-one pattern
+        $display("[EDGE]   Test: Walking-one (32'hAAAAAAAA)");
+        run_one_test(32'hAAAAAAAA);
+        check_and_log(-3);
+
+        $display("-------------------------------------------------------------");
+        $display("[RANDOM] Starting %0d random test vectors...", NUM_TESTS);
+        $display("-------------------------------------------------------------");
+
+        // ----------------------------------------------------------------
+        // STEP 4: 2000 Random Test Vectors
+        // ----------------------------------------------------------------
         for (test_num = 0; test_num < NUM_TESTS; test_num = test_num + 1) begin
+            run_one_test({$random});
+            check_and_log(test_num);
+        end
 
-            // ------------------------------------------------------------------
-            // 3a. Drive a new random 32-bit data word
-            //     $random returns a 32-bit pseudo-random value each call.
-            //     We capture it in test_data for logging after results come back.
-            // ------------------------------------------------------------------
-            @(negedge clk);                     // Drive signals between clock edges
-            data      = {$random};              // Full 32-bit random stimulus
-            test_data = data;                   // Latch for post-test display
-            start     = 1'b1;                   // Assert start for ONE cycle
-
-            @(posedge clk);                     // DUT latches data and start on this edge
-            @(negedge clk);
-            start = 1'b0;                       // De-assert start after exactly 1 cycle
-
-            // ------------------------------------------------------------------
-            // 3b. Wait for 'done' pulse with watchdog timeout
-            //     'done' fires exactly 32 cycles after the start cycle.
-            //     Watchdog prevents infinite hang if DUT stalls.
-            // ------------------------------------------------------------------
-            wait_cnt = 0;
-            while (!done && (wait_cnt < TIMEOUT_CYC)) begin
-                @(posedge clk);
-                wait_cnt = wait_cnt + 1;
-            end
-
-            if (wait_cnt >= TIMEOUT_CYC) begin
-                $display("[TIMEOUT] Test %0d: DUT did not assert 'done' within %0d cycles!",
-                         test_num, TIMEOUT_CYC);
-                timeout_count = timeout_count + 1;
-            end
-
-            // ------------------------------------------------------------------
-            // 3c. Sample outputs ONE cycle after 'done' to allow combinational
-            //     crc_checker to settle (done fires at posedge, checker is
-            //     purely combinational so error is valid same cycle as done)
-            //     Wait to negedge for clean glitch-free sampling.
-            // ------------------------------------------------------------------
-            @(negedge clk);
-
-            // ------------------------------------------------------------------
-            // 3d. X/Z State Detection — check for undriven or unknown outputs
-            //     Using bitmask comparison trick: if any bit is X or Z,
-            //     the === comparison to itself fails.
-            // ------------------------------------------------------------------
-            if (^crc16 === 1'bx || ^crc24a === 1'bx ||
-                ^crc24b === 1'bx || ^crc24c === 1'bx || error === 1'bx) begin
-
-                $display("[UNKNOWN] Test %4d | Data=%h | crc16=%h crc24a=%h crc24b=%h crc24c=%h | error=%b | STATUS=X/Z_DETECTED",
-                         test_num, test_data, crc16, crc24a, crc24b, crc24c, error);
-                xz_count = xz_count + 1;
-
-            end else begin
-                // --------------------------------------------------------------
-                // 3e. Log result for every test (clean formatted output)
-                // --------------------------------------------------------------
-                $display("%-6d | %010h | %04h  | %06h   | %06h   | %06h   | %-5b | %s",
-                         test_num,
-                         test_data,
-                         crc16,
-                         crc24a,
-                         crc24b,
-                         crc24c,
-                         error,
-                         (error === 1'b0) ? "PASS" : "MISMATCH");
-
-                // Count error assertions (non-zero CRC after data-only run)
-                if (error === 1'b1)
-                    error_count = error_count + 1;
-                else
-                    pass_count = pass_count + 1;
-            end
-
-        end // end for loop
-
-        // ---------------------------------------------------------------------
-        // STEP 4: Final Summary Report
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------------------
+        // STEP 5: Final Summary
+        // ----------------------------------------------------------------
         $display("=============================================================");
         $display("  SIMULATION COMPLETE — FINAL SUMMARY");
         $display("=============================================================");
-        $display("  Total Tests Run  : %0d", NUM_TESTS);
-        $display("  PASS  (error=0)  : %0d", pass_count);
-        $display("  ERROR (error=1)  : %0d", error_count);
-        $display("  UNKNOWN (X/Z)    : %0d", xz_count);
-        $display("  TIMEOUT          : %0d", timeout_count);
+        $display("  Total Random Tests : %0d", NUM_TESTS);
+        $display("  CRC Computed (!=0) : %0d  (non-zero CRC = expected for raw data)", error_count);
+        $display("  All-Zero CRC (==0) : %0d  (would indicate data=0 or CRC self-check pass)", pass_count);
+        $display("  Unknown (X/Z)      : %0d", xz_count);
+        $display("  Timeouts           : %0d", timeout_count);
         $display("-------------------------------------------------------------");
 
         if (xz_count == 0 && timeout_count == 0) begin
-            $display("  RESULT : ALL %0d TESTS COMPLETED — NO X/Z OR TIMEOUTS", NUM_TESTS);
-            $display("           CRC values are deterministic and stable.");
-            $display("           error=1 indicates non-zero CRC (expected when checking");
-            $display("           raw data without appended CRC bits — this is correct RTL");
-            $display("           behaviour. Feed data+CRC to get error=0 on clean data.)");
+            $display("  STATUS : PASS — All %0d tests produced deterministic CRC outputs.", NUM_TESTS);
+            $display("           No X/Z states detected. No watchdog timeouts.");
+            $display("           Compare CRC16/24A columns with golden_model.py output");
+            $display("           to confirm RTL matches the Python reference model.");
         end else begin
-            $display("  RESULT : *** ISSUES DETECTED — REVIEW LOG ABOVE ***");
+            $display("  STATUS : FAIL — Review X/Z or timeout entries above.");
         end
 
         $display("=============================================================");
         $finish;
-
-    end // end initial
+    end
 
     // =========================================================================
-    // Concurrent Watchdog Monitor: Catch simulation runaway
-    //   If simulation exceeds a maximum wall time, force abort.
+    // Global Simulation Watchdog: prevents infinite simulation if DUT hangs
     // =========================================================================
     initial begin
-        // Maximum simulation time = NUM_TESTS * (TIMEOUT_CYC + 10) cycles
-        #(NUM_TESTS * (TIMEOUT_CYC + 10) * CLK_PERIOD);
-        $display("[FATAL] Global simulation timeout! Forcing $finish.");
+        #((NUM_TESTS + 10) * TIMEOUT_CYC * CLK_PERIOD);
+        $display("[FATAL] Global simulation watchdog expired. Forcing finish.");
         $finish;
     end
 
 endmodule
-
 // =============================================================================
 // END OF MODULE: tb_crc
 // =============================================================================

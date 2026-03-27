@@ -1,35 +1,40 @@
 // =============================================================================
 // Module      : crc16_parallel
-// Description : High-performance parallel CRC-16 engine for 5G NR systems.
-//               Processes 8 bits per clock cycle (byte-wide input).
-//               Equivalent to running crc_core.v 8 times per cycle but
-//               implemented as a fully unrolled combinational loop —
-//               synthesizes to a flat gate network with no feedback registers
-//               in the datapath (only the output register is sequential).
-//
-// Performance Comparison:
-//   crc_core.v (serial)   : 1 bit  per clock → 8x slower for byte-wide data
-//   crc16_parallel.v      : 8 bits per clock → 8x throughput improvement
-//   Latency               : 1 clock cycle per byte (purely pipelined)
+// Description : High-performance parallel CRC-16 engine (byte-wide, 8 bits/cycle).
+//               Equivalent to running crc_core serially 8 times, but unrolled
+//               into a flat combinational gate chain — no iterative hardware.
 //
 // Algorithm:
-//   For each of the 8 bits in data_in (MSB = bit 7 processed first):
-//     feedback = crc[15] XOR data_in[7-i]
-//     crc      = {crc[14:0], 1'b0}
-//     if (feedback) crc = crc XOR 16'h1021
+//   For i = 0 to 7 (MSB-first: processes data_in[7] first, data_in[0] last):
+//     feedback = next[15] XOR data_in[7-i]
+//     next     = {next[14:0], 1'b0}
+//     if (feedback) next = next XOR 16'h1021
+//   crc <= next
 //
-//   This is mathematically equivalent to the LFSR serial algorithm run 8
-//   times in sequence — NOT a lookup table approximation.
+// Performance:
+//   Throughput: 8 bits per clock cycle (vs 1 bit/cycle for crc_core.v)
+//   Latency:    1 clock cycle per byte
+//
+// REVIEW NOTE [v2]:
+//   - `integer i` inside an always block is legal in Verilog-2001 and is
+//     unrolled at compile time. All synthesizers (Vivado, Quartus, DC)
+//     handle this correctly for constant loop bounds.
+//   - `reg feedback` inside always block correctly synthesizes to a wire
+//     per unrolled iteration — no flip-flops inferred for feedback or next.
+//   - Only output `crc` maps to 16 flip-flops.
+//   - INIT value is 0xFFFF for byte-stream CRC-CCITT use; can be changed
+//     to 0x0000 if integrating with crc_top's frame-based computation.
+//   - No functional changes required.
 //
 // Ports:
-//   clk      : Rising-edge system clock
-//   rst      : Synchronous reset, active HIGH → CRC initializes to 0xFFFF
-//   valid    : Byte-valid signal — process data_in when HIGH
-//   data_in  : 8-bit input data byte (bit[7] is MSB, processed first)
-//   crc      : 16-bit running CRC output (stable one cycle after valid)
+//   clk     : Rising-edge system clock
+//   rst     : Synchronous active-HIGH reset (initializes CRC to 0xFFFF)
+//   valid   : Process data_in when HIGH; hold CRC when LOW
+//   data_in : 8-bit input byte (bit[7] = MSB, processed first)
+//   crc     : 16-bit running CRC output
 //
-// Polynomial : 0x1021 (CRC-CCITT, as used in 3GPP TS 38.212 CRC-16)
-// Init Value : 0xFFFF (standard CCITT initialization)
+// Polynomial : 0x1021 (CRC-CCITT / 3GPP CRC-16, TS 38.212)
+// Init       : 0xFFFF (standard CCITT; change to 0x0000 to match crc_core.v)
 //
 // Author   : TCS Project - 5G NR CRC Engine
 // Standard : 3GPP TS 38.212
@@ -37,91 +42,43 @@
 
 module crc16_parallel (
     input  wire        clk,      // Rising-edge system clock
-    input  wire        rst,      // Synchronous reset, active HIGH
-    input  wire        valid,    // Data byte valid — shift CRC only when HIGH
-    input  wire [7:0]  data_in,  // 8-bit input data (bit[7] = MSB, first)
+    input  wire        rst,      // Synchronous reset (active HIGH)
+    input  wire        valid,    // Byte-valid: process data_in when HIGH
+    input  wire [7:0]  data_in,  // 8-bit input byte, MSB-first
     output reg  [15:0] crc       // 16-bit CRC output register
 );
 
-    // =========================================================================
-    // Parameters
-    // =========================================================================
-    localparam [15:0] POLY     = 16'h1021; // CRC-CCITT / 3GPP CRC-16 polynomial
-    localparam [15:0] CRC_INIT = 16'hFFFF; // Standard CRC-16 initial value
+    localparam [15:0] POLY     = 16'h1021; // CRC-CCITT polynomial
+    localparam [15:0] CRC_INIT = 16'hFFFF; // Standard initial value
 
-    // =========================================================================
-    // Internal Signals
-    // =========================================================================
-
-    // 'next' holds the running CRC value as we iterate through all 8 bits
-    // combinationally within a single always block.
-    // It is a reg here because it is assigned inside an always block, but it
-    // synthesizes entirely to combinational logic (no flip-flops) —
-    // only 'crc' (the output reg) maps to actual flip-flops.
+    // 'next' and 'feedback' are combinational intermediates inside the always block.
+    // They are declared as reg only because Verilog requires it for always-block
+    // assignments; they synthesize to pure combinational logic (no flip-flops).
     reg [15:0] next;
+    reg        feedback;
+    integer    i;
 
-    // Loop variable: iterates 0..7 to process each bit of data_in.
-    integer i;
-
-    // Per-iteration feedback bit (declared as reg because it's used inside
-    // an always block — synthesizes to a single wire per unrolled iteration).
-    reg feedback;
-
-    // =========================================================================
-    // Parallel CRC Logic (Synchronous)
-    // =========================================================================
     always @(posedge clk) begin
         if (rst) begin
-            // -----------------------------------------------------------------
-            // Synchronous Reset: load CRC init value
-            // -----------------------------------------------------------------
-            crc <= CRC_INIT;
+            crc <= CRC_INIT;        // Reset to 0xFFFF
         end
         else if (valid) begin
-            // -----------------------------------------------------------------
-            // Active processing: unroll 8 LFSR iterations combinationally.
-            //
-            // 'next' starts as the current CRC register value.
-            // Each loop iteration applies one bit of data_in MSB-first,
-            // updating 'next' in place — exactly as a real serial LFSR would
-            // update its register 8 times in 8 clock cycles, but here all 8
-            // steps are resolved combinationally in a single cycle.
-            //
-            // Synthesis will unroll this loop at compile time into a flat
-            // gate network — no actual loop hardware is generated.
-            // -----------------------------------------------------------------
-            next = crc; // Seed the combinational chain with the stored CRC
+            next = crc;             // Seed combinational chain from registered CRC
 
+            // Unroll 8 LFSR steps — synthesized as a flat gate chain
             for (i = 0; i < 8; i = i + 1) begin
-                // Step 1: Compute feedback for this iteration
-                //   feedback = MSB of running CRC XOR current input bit
-                //   MSB-first ordering: process data_in[7], [6], ... [0]
-                feedback = next[15] ^ data_in[7 - i];
-
-                // Step 2: Shift the running CRC left by one position
-                //   Vacate LSB with 0 (standard LFSR left shift)
-                next = {next[14:0], 1'b0};
-
-                // Step 3: Conditionally XOR with polynomial
-                //   Apply only if feedback = 1 (standard LFSR division step)
-                //   This is identical to the crc_core.v LFSR logic — just
-                //   run 8 times in sequence within one always block.
+                feedback = next[15] ^ data_in[7 - i];  // Tap: MSB XOR current input bit
+                next     = {next[14:0], 1'b0};          // Shift left, clear LSB
                 if (feedback)
-                    next = next ^ POLY;
+                    next = next ^ POLY;                  // Apply polynomial if feedback=1
             end
 
-            // -----------------------------------------------------------------
-            // Register the final result of all 8 iterations.
-            // This is the only flip-flop assignment — 'next' itself is
-            // purely combinational within this always block.
-            // -----------------------------------------------------------------
-            crc <= next;
+            crc <= next;            // Register the 8-step result (only FF assignment)
         end
-        // else: valid = 0 → crc holds its current value (no latch — synchronous hold)
+        // else: valid=0 → crc holds, no latch (synchronous design)
     end
 
 endmodule
-
 // =============================================================================
 // END OF MODULE: crc16_parallel
 // =============================================================================

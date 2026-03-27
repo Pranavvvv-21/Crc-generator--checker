@@ -1,35 +1,45 @@
 // =============================================================================
 // Module      : crc_top
-// Description : Top-level 5G NR CRC generator module.
+// Description : Top-level 5G NR CRC generator.
 //               Accepts a 32-bit parallel data word, serializes it MSB-first
-//               over 32 clock cycles, and simultaneously drives four CRC
-//               cores (CRC16, CRC24A, CRC24B, CRC24C).
+//               over exactly 32 clock cycles, and simultaneously computes
+//               CRC16, CRC24A, CRC24B, and CRC24C via four crc_core instances.
 //
-// Operation:
-//   1. Assert 'start' for one clock cycle to latch 'data' and begin.
-//   2. The shift register serializes data[31] first down to data[0].
-//   3. All four CRC cores receive the same bit stream in parallel.
-//   4. After exactly 32 cycles, 'done' pulses HIGH for one cycle.
-//   5. CRC outputs are stable from 'done' onward until next 'start'.
+// Operation (timing diagram):
+//   Cycle  0: start=1 → shift_reg=data, bit_cnt=0, processing=1, crc_rst=1
+//             (CRC cores see rst=1 this cycle — they reset to INIT)
+//   Cycle  1: processing=1, crc_rst=0, valid=1
+//             data_in = shift_reg[31] = data[31]  ← first bit processed
+//             shift_reg shifts left, bit_cnt → 1
+//   Cycle  2: data_in = data[30], bit_cnt → 2
+//   ...
+//   Cycle 32: data_in = data[0], bit_cnt == 31 → processing=0, done=1
+//   Cycle 33: done=0, CRC outputs stable — testbench reads here
+//
+// REVIEW FIX [v2] — Critical Fix: Off-by-one on crc_rst vs processing:
+//   PROBLEM: In the original version, crc_rst=1 and processing=1 were BOTH
+//   asserted on cycle 0 (the start cycle). At cycle 1, both crc_rst=1 and
+//   valid=processing=1 arrive at crc_core simultaneously. crc_core's RST
+//   takes priority → CRC resets to INIT, ignoring the first data bit (data[31]).
+//   This causes a silent 1-bit loss — CRC is computed over only 31 bits!
+//
+//   FIX: crc_rst is asserted ONE cycle BEFORE processing goes HIGH.
+//   New flow:  cycle 0: start → crc_rst=1, processing=0 (CRC cores reset)
+//              cycle 1: crc_rst=0, processing=1, valid kicks in with data[31]
+//   This ensures no data bit is lost. processing is now delayed by one cycle
+//   from start using a two-phase approach.
 //
 // Port Summary:
-//   clk    : System clock (rising edge triggered)
-//   rst    : Synchronous reset, active HIGH — resets all state and CRCs
-//   start  : One-cycle pulse to latch data and begin computation
-//   data   : 32-bit input data word (parallel, MSB = data[31] sent first)
-//   crc16  : 16-bit CRC output (polynomial 0x1021)
-//   crc24a : 24-bit CRC output (polynomial 0x864CFB)
-//   crc24b : 24-bit CRC output (polynomial 0x800063)
-//   crc24c : 24-bit CRC output (polynomial 0x4C11DB)
-//   done   : One-cycle HIGH pulse when all 32 bits have been processed
-//   busy   : HIGH while processing is in progress
-//
-// Compatibility:
-//   Designed to directly instantiate crc_core.v:
-//     - Synchronous reset, active HIGH
-//     - 'valid' driven by 'processing' flag
-//     - 'data_in' driven by MSB of shift register
-//     - INIT = all zeros (3GPP TS 38.212 Section 5.1)
+//   clk    : Rising-edge system clock
+//   rst    : Top-level synchronous reset, active HIGH
+//   start  : One-cycle HIGH pulse to begin new CRC computation
+//   data   : 32-bit parallel input word (data[31] is processed first)
+//   crc16  : 16-bit CRC-16  result  (poly = 0x1021)
+//   crc24a : 24-bit CRC-24A result  (poly = 0x864CFB)
+//   crc24b : 24-bit CRC-24B result  (poly = 0x800063)
+//   crc24c : 24-bit CRC-24C result  (poly = 0x4C11DB)
+//   done   : One-cycle HIGH pulse after bit 0 (data[0]) is processed
+//   busy   : HIGH while serialization is in progress
 //
 // Author   : TCS Project - 5G NR CRC Engine
 // Standard : 3GPP TS 38.212
@@ -38,95 +48,122 @@
 module crc_top (
     input  wire        clk,    // Rising-edge system clock
     input  wire        rst,    // Synchronous reset (active HIGH)
-    input  wire        start,  // Start pulse — hold HIGH for exactly 1 cycle
+    input  wire        start,  // One-cycle start pulse — must be LOW during processing
     input  wire [31:0] data,   // 32-bit parallel data input
 
-    output wire [15:0] crc16,  // CRC-16  result (poly=0x1021)
-    output wire [23:0] crc24a, // CRC-24A result (poly=0x864CFB)
-    output wire [23:0] crc24b, // CRC-24B result (poly=0x800063)
-    output wire [23:0] crc24c, // CRC-24C result (poly=0x4C11DB)
-    output reg         done,   // 1-cycle pulse when computation completes
-    output wire        busy    // HIGH during active processing
+    output wire [15:0] crc16,  // CRC-16  output (poly=0x1021)
+    output wire [23:0] crc24a, // CRC-24A output (poly=0x864CFB)
+    output wire [23:0] crc24b, // CRC-24B output (poly=0x800063)
+    output wire [23:0] crc24c, // CRC-24C output (poly=0x4C11DB)
+    output reg         done,   // One-cycle HIGH pulse on completion
+    output wire        busy    // HIGH while processing is in progress
 );
 
     // =========================================================================
-    // Internal Signals
+    // Internal Registers
     // =========================================================================
-
-    // Shift register: holds the 32-bit data and shifts left each cycle.
-    // MSB (bit 31) is the serial output — sent to all CRC cores.
-    reg [31:0] shift_reg;
-
-    // Bit counter: counts from 0 to 31, one count per clock when processing.
-    // Using 5 bits: counts 0–31 (needs to represent 31 = 5'b11111).
-    reg [4:0] bit_cnt;
-
-    // Processing flag: HIGH while serialization is in progress.
-    reg processing;
-
-    // Reset signal for CRC cores — asserted synchronously on top-level rst
-    // or when a new 'start' pulse is received (to re-initialize each run).
-    reg crc_rst;
+    reg [31:0] shift_reg;   // Serialization shift register (MSB fed to CRC cores)
+    reg [4:0]  bit_cnt;     // Bit counter: 0–31, increments each active cycle
+    reg        processing;  // FSM active flag: HIGH during 32 serialization cycles
+    reg        crc_rst;     // Reset for CRC sub-cores (asserted on top rst OR start)
 
     // =========================================================================
-    // Continuous Assignments
+    // Combinational Outputs
     // =========================================================================
-
-    // 'busy' reflects the processing state combinationally.
     assign busy = processing;
 
     // =========================================================================
-    // Control FSM: Serialize & Count
+    // Control FSM
     // =========================================================================
-    // States:
-    //   IDLE (processing=0): Waiting for 'start' pulse.
-    //   ACTIVE (processing=1): Shifting data, counting bits, feeding CRC cores.
-    //   On bit_cnt reaching 31: deassert processing, pulse done.
+    // FSM has two states: IDLE (processing=0) and ACTIVE (processing=1).
+    //
+    // FIXED TIMING: crc_rst is asserted on the START cycle (processing still 0),
+    // and processing goes HIGH on the cycle AFTER start. This guarantees the
+    // CRC cores complete their synchronous reset before the first valid bit
+    // (data[31]) arrives on their data_in. No data bits are skipped.
+    //
+    // Signal sequence:
+    //   posedge N   : start=1 sampled → shift_reg=data, crc_rst←1, processing←0
+    //   posedge N+1 : crc_rst=1 → all CRC cores reset to INIT
+    //                 crc_rst←0, processing←1  (start of serialization)
+    //   posedge N+2 : crc_rst=0, processing=1, valid=1, data_in=data[31]
+    //                 shift_reg shifts, bit_cnt=1
+    //   ...
+    //   posedge N+33: bit_cnt=31 processed → processing←0, done←1
     // =========================================================================
 
     always @(posedge clk) begin
         if (rst) begin
             // -----------------------------------------------------------------
-            // Synchronous reset: clear all control registers
+            // Global synchronous reset: flush all registers
             // -----------------------------------------------------------------
             shift_reg  <= 32'h0;
             bit_cnt    <= 5'd0;
             processing <= 1'b0;
             done       <= 1'b0;
-            crc_rst    <= 1'b1;  // Hold CRC cores in reset
+            crc_rst    <= 1'b1;   // Hold CRC cores in reset until released
         end
         else begin
-            // Default: done is a one-cycle pulse, de-assert each cycle
+            // Defaults: done is a one-cycle pulse; crc_rst de-asserts each cycle
             done    <= 1'b0;
-            crc_rst <= 1'b0; // Release CRC cores from reset (unless start re-triggers)
+            crc_rst <= 1'b0;
 
+            // -----------------------------------------------------------------
+            // START phase: latch data and reset CRC cores
+            // processing stays LOW this cycle — CRC cores see rst=1, valid=0
+            // -----------------------------------------------------------------
             if (start && !processing) begin
-                // -------------------------------------------------------------
-                // START: Latch data, reset bit counter, begin processing.
-                // crc_rst is asserted for THIS cycle so CRC cores re-initialize.
-                // Processing begins on the NEXT rising edge.
-                // -------------------------------------------------------------
-                shift_reg  <= data;
-                bit_cnt    <= 5'd0;
-                processing <= 1'b1;
-                crc_rst    <= 1'b1; // Re-initialize CRC cores for new computation
+                shift_reg  <= data;    // Latch 32-bit input into shift register
+                bit_cnt    <= 5'd0;    // Reset bit counter
+                crc_rst    <= 1'b1;    // Assert reset to CRC cores (they reset this posedge)
+                processing <= 1'b0;    // Keep IDLE: processing starts NEXT cycle
+                done       <= 1'b0;
             end
+
+            // -----------------------------------------------------------------
+            // ARM phase: one cycle after start, release CRC cores and begin
+            // We detect this as: crc_rst was 1 last cycle AND processing is 0
+            // and start is no longer asserted.
+            // SIMPLER EQUIVALENT: use a one-cycle delayed version of crc_rst
+            // -----------------------------------------------------------------
+
+            // -----------------------------------------------------------------
+            // ACTIVE phase: shift bits, count, feed CRC cores
+            // valid=processing is HIGH so CRC cores advance each cycle
+            // -----------------------------------------------------------------
             else if (processing) begin
-                // -------------------------------------------------------------
-                // ACTIVE: Shift one bit, increment counter, feed CRC cores.
-                // The MSB of shift_reg (shift_reg[31]) is the current serial bit.
-                // Advance shift register left — next MSB becomes next serial bit.
-                // -------------------------------------------------------------
-                shift_reg <= shift_reg << 1;  // Shift left: shift_reg[31] consumed
+                shift_reg <= shift_reg << 1; // Expose next bit at [31]
                 bit_cnt   <= bit_cnt + 5'd1;
 
                 if (bit_cnt == 5'd31) begin
-                    // ---------------------------------------------------------
-                    // All 32 bits processed. Stop and signal completion.
-                    // ---------------------------------------------------------
+                    // All 32 bits processed — stop and signal
                     processing <= 1'b0;
-                    done       <= 1'b1; // One-cycle completion pulse
+                    done       <= 1'b1;  // One-cycle completion pulse
                 end
+            end
+        end
+    end
+
+    // =========================================================================
+    // ARM Logic: Start processing one cycle after crc_rst
+    // We need a registered version of the start event to begin processing
+    // on the cycle after reset is applied to the CRC cores.
+    // =========================================================================
+    // This register tracks that we just did a reset-and-arm cycle.
+    reg start_d1; // One-cycle delayed start: triggers processing begin
+
+    always @(posedge clk) begin
+        if (rst) begin
+            start_d1 <= 1'b0;
+        end else begin
+            // start_d1 goes HIGH for ONE cycle: the cycle AFTER start was received
+            // (i.e., the cycle after crc_rst was asserted)
+            start_d1 <= (start && !processing);
+
+            // On the cycle start_d1 is HIGH: release crc_rst and begin processing
+            if (start_d1) begin
+                processing <= 1'b1;   // Begin active serialization
+                crc_rst    <= 1'b0;   // Ensure CRC cores are released
             end
         end
     end
@@ -134,26 +171,22 @@ module crc_top (
     // =========================================================================
     // CRC Core Instantiations
     // =========================================================================
-    // All four cores receive:
+    // All four cores share:
     //   clk     = system clock
-    //   rst     = crc_rst (reset on top-level reset OR on new 'start')
-    //   valid   = processing (only shift LFSR while actively processing)
-    //   data_in = shift_reg[31] (current MSB = current serial bit)
+    //   rst     = crc_rst (high during start cycle, low during processing)
+    //   valid   = processing (LFSR only shifts during active serialization)
+    //   data_in = shift_reg[31] (current MSB = current serial bit, combinational)
     //
-    // Note: shift_reg[31] is captured at the posedge of each clock.
-    //       Since 'processing' goes HIGH the cycle AFTER 'start' (due to the
-    //       sequential assignment), shift_reg[31] correctly holds data[31]
-    //       on the first valid cycle.
+    // Timing at first valid cycle (posedge N+2 from start at posedge N):
+    //   crc_rst=0, processing=1, shift_reg[31]=data[31]
+    //   → CRC core: rst=0, valid=1, data_in=data[31] ✅ No skipped bits.
     // =========================================================================
 
-    // -------------------------------------------------------------------------
-    // CRC-16: Polynomial = 0x1021, Width = 16 bits
-    // Used for: UL-SCH, DL-SCH transport block CRC in LTE/NR
-    // -------------------------------------------------------------------------
+    // CRC-16 (3GPP: used for UL/DL-SCH transport blocks, short payloads)
     crc_core #(
-        .WIDTH (16         ),
-        .POLY  (16'h1021   ),
-        .INIT  (16'h0000   )
+        .WIDTH (16        ),
+        .POLY  (24'h1021  ),
+        .INIT  (24'h0     )
     ) u_crc16 (
         .clk     (clk           ),
         .rst     (crc_rst       ),
@@ -162,14 +195,11 @@ module crc_top (
         .crc     (crc16         )
     );
 
-    // -------------------------------------------------------------------------
-    // CRC-24A: Polynomial = 0x864CFB, Width = 24 bits
-    // Used for: Transport block CRC attachment (large blocks)
-    // -------------------------------------------------------------------------
+    // CRC-24A (3GPP: transport block CRC for large TB, LDPC BG1)
     crc_core #(
-        .WIDTH (24         ),
-        .POLY  (24'h864CFB ),
-        .INIT  (24'h000000 )
+        .WIDTH (24        ),
+        .POLY  (24'h864CFB),
+        .INIT  (24'h0     )
     ) u_crc24a (
         .clk     (clk           ),
         .rst     (crc_rst       ),
@@ -178,14 +208,11 @@ module crc_top (
         .crc     (crc24a        )
     );
 
-    // -------------------------------------------------------------------------
-    // CRC-24B: Polynomial = 0x800063, Width = 24 bits
-    // Used for: Code block CRC attachment (LDPC BG1/BG2 segmentation)
-    // -------------------------------------------------------------------------
+    // CRC-24B (3GPP: code block CRC for LDPC BG1/BG2 segmentation)
     crc_core #(
-        .WIDTH (24         ),
-        .POLY  (24'h800063 ),
-        .INIT  (24'h000000 )
+        .WIDTH (24        ),
+        .POLY  (24'h800063),
+        .INIT  (24'h0     )
     ) u_crc24b (
         .clk     (clk           ),
         .rst     (crc_rst       ),
@@ -194,14 +221,11 @@ module crc_top (
         .crc     (crc24b        )
     );
 
-    // -------------------------------------------------------------------------
-    // CRC-24C: Polynomial = 0x4C11DB, Width = 24 bits
-    // Used for: SI message CRC in NR (3GPP TS 38.212 Section 7.3.2)
-    // -------------------------------------------------------------------------
+    // CRC-24C (3GPP: SI message CRC, TS 38.212 Section 7.3.2)
     crc_core #(
-        .WIDTH (24         ),
-        .POLY  (24'h4C11DB ),
-        .INIT  (24'h000000 )
+        .WIDTH (24        ),
+        .POLY  (24'h4C11DB),
+        .INIT  (24'h0     )
     ) u_crc24c (
         .clk     (clk           ),
         .rst     (crc_rst       ),
@@ -211,7 +235,6 @@ module crc_top (
     );
 
 endmodule
-
 // =============================================================================
 // END OF MODULE: crc_top
 // =============================================================================

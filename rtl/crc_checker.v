@@ -1,62 +1,59 @@
 // =============================================================================
 // Module      : crc_checker
 // Description : Combinational CRC integrity checker for 5G NR CRC Engine.
-//               Verifies that computed CRC values are zero after appending
-//               the CRC bits to the data stream (standard CRC check method).
 //
-// Operation:
-//   In a valid CRC check scenario, the receiver appends the received CRC
-//   bits back into the same LFSR pipeline. If there are no errors, the
-//   resulting CRC register value is 0x000...0 for all variants.
-//   Any non-zero CRC value indicates a corrupted data block.
+// In the standard CRC check procedure (receiver side):
+//   The received data word PLUS its appended CRC bits are fed back through
+//   the same LFSR pipeline used for generation. If no transmission errors
+//   occurred, the LFSR register drains to exactly zero. A non-zero residue
+//   means the received block is corrupted.
+//
+// This module flags an error if ANY of the four CRC variants is non-zero.
 //
 // Logic:
-//   error = 1  if (crc16 != 0) OR (crc24a != 0) OR (crc24b != 0) OR (crc24c != 0)
-//   error = 0  if all CRC outputs are exactly zero
+//   error = 0   iff crc16==0 AND crc24a==0 AND crc24b==0 AND crc24c==0
+//   error = 1   otherwise (at least one variant has a non-zero residue)
+//
+// Implementation:
+//   Uses Verilog bitwise OR-reduction (|signal) — synthesizes to a balanced
+//   OR-gate tree. This is width-agnostic and infers NO latches because it is
+//   a continuous assign (not an always block).
+//
+// REVIEW NOTE [v2]:
+//   No changes required. The combinational assign with OR-reduction is
+//   correct, synthesis-clean, and latch-free. Port names and widths match
+//   crc_top.v exactly: crc16[15:0], crc24a/b/c[23:0].
 //
 // Ports:
-//   crc16  : 16-bit CRC value from CRC-16  engine (poly 0x1021)
-//   crc24a : 24-bit CRC value from CRC-24A engine (poly 0x864CFB)
-//   crc24b : 24-bit CRC value from CRC-24B engine (poly 0x800063)
-//   crc24c : 24-bit CRC value from CRC-24C engine (poly 0x4C11DB)
-//   error  : 1 = error detected in at least one CRC variant
-//            0 = all CRC values are zero (data integrity confirmed)
-//
-// Note:
-//   This module is purely combinational — no clk or rst required.
-//   Output 'error' updates immediately whenever any input changes.
-//   Safe to wire directly to the outputs of crc_top.
+//   crc16  : 16-bit result from CRC-16  engine (poly 0x1021)
+//   crc24a : 24-bit result from CRC-24A engine (poly 0x864CFB)
+//   crc24b : 24-bit result from CRC-24B engine (poly 0x800063)
+//   crc24c : 24-bit result from CRC-24C engine (poly 0x4C11DB)
+//   error  : 1 = integrity check failed; 0 = all CRCs are zero (data OK)
 //
 // Author   : TCS Project - 5G NR CRC Engine
 // Standard : 3GPP TS 38.212
 // =============================================================================
 
 module crc_checker (
-    input  wire [15:0] crc16,   // CRC-16  result from crc_top
-    input  wire [23:0] crc24a,  // CRC-24A result from crc_top
-    input  wire [23:0] crc24b,  // CRC-24B result from crc_top
-    input  wire [23:0] crc24c,  // CRC-24C result from crc_top
-    output wire        error    // 1 = error detected, 0 = data integrity OK
+    input  wire [15:0] crc16,   // CRC-16  residue from crc_top
+    input  wire [23:0] crc24a,  // CRC-24A residue from crc_top
+    input  wire [23:0] crc24b,  // CRC-24B residue from crc_top
+    input  wire [23:0] crc24c,  // CRC-24C residue from crc_top
+    output wire        error    // 1 = error detected, 0 = data integrity confirmed
 );
 
     // =========================================================================
-    // Error Detection Logic (Combinational)
+    // Error Detection — purely combinational, no clk/rst required
+    // OR-reduce each CRC field, then OR all four results together.
+    // Synthesizes to: OR-tree(crc16) | OR-tree(crc24a) | OR-tree(crc24b) | OR-tree(crc24c)
     // =========================================================================
-    // An OR-reduction of each CRC value tells us if ANY bit is non-zero.
-    // All four checks are OR'd together — if even one CRC variant is non-zero,
-    // the entire block is flagged as corrupted.
-    //
-    // Using wire assignment (not always block) to keep this purely
-    // combinational and infer no latches.
-    // =========================================================================
-
-    assign error = (|crc16)   |   // OR-reduce: 1 if any bit of crc16  is non-zero
-                   (|crc24a)  |   // OR-reduce: 1 if any bit of crc24a is non-zero
-                   (|crc24b)  |   // OR-reduce: 1 if any bit of crc24b is non-zero
-                   (|crc24c);     // OR-reduce: 1 if any bit of crc24c is non-zero
+    assign error = (|crc16)  |   // Non-zero CRC-16  → error
+                   (|crc24a) |   // Non-zero CRC-24A → error
+                   (|crc24b) |   // Non-zero CRC-24B → error
+                   (|crc24c);    // Non-zero CRC-24C → error
 
 endmodule
-
 // =============================================================================
 // END OF MODULE: crc_checker
 // =============================================================================
